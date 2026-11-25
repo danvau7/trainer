@@ -24,10 +24,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2/ktesting"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,6 +42,7 @@ import (
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 	"github.com/kubeflow/trainer/v2/pkg/constants"
+	"github.com/kubeflow/trainer/v2/pkg/features"
 	testingutil "github.com/kubeflow/trainer/v2/pkg/util/testing"
 )
 
@@ -289,7 +293,23 @@ func TestClusterTrainingRuntimeDeleteObjects(t *testing.T) {
 }
 
 func TestClusterTrainingRuntimeValidateObjects(t *testing.T) {
+	// Do not use t.Parallel() — SetFeatureGateDuringTest mutates global state.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobWorkloadAwareScheduling, true)
 	validRuntime := testingutil.MakeClusterTrainingRuntimeWrapper("test-runtime").Obj()
+	staleSnapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-job-runtime-snapshot",
+			Namespace: metav1.NamespaceDefault,
+			OwnerReferences: []metav1.OwnerReference{{
+				UID:        "uid-deleted-test-job",
+				Controller: ptr.To(true),
+			}},
+		},
+	}
+	recreatedTrainJob := testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+		UID("uid-test-job").
+		RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), "test-runtime").
+		Obj()
 
 	deprecatedRuntime := testingutil.MakeClusterTrainingRuntimeWrapper("deprecated-runtime").Obj()
 	deprecatedRuntime.Labels = map[string]string{
@@ -298,7 +318,9 @@ func TestClusterTrainingRuntimeValidateObjects(t *testing.T) {
 
 	cases := map[string]struct {
 		trainJob        *trainer.TrainJob
+		oldTrainJob     *trainer.TrainJob
 		existingRuntime *trainer.ClusterTrainingRuntime
+		existingObjects []client.Object
 		wantErrs        field.ErrorList
 		wantWarnings    admission.Warnings
 	}{
@@ -334,6 +356,50 @@ func TestClusterTrainingRuntimeValidateObjects(t *testing.T) {
 				`Referenced ClusterTrainingRuntime "deprecated-runtime" is deprecated and will be removed in a future release of Kubeflow Trainer. See runtime deprecation policy: ` + constants.RuntimeDeprecationPolicyURL,
 			},
 		},
+		"returns field error when TrainJob sets resourceClaimsPerNode and runtime sets Job-level resourceClaims": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), "test-runtime").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "gpu-template"}).
+					Obj()).
+				Obj(),
+			existingRuntime: testingutil.MakeClusterTrainingRuntimeWrapper("test-runtime").
+				RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeClusterTrainingRuntimeWrapper("test-runtime").Obj().Spec).
+					Scheduling(&trainer.TrainingRuntimeScheduling{
+						ReplicatedJobs: []trainer.ReplicatedJobScheduling{
+							{TargetReplicatedJobs: []string{constants.DatasetInitializer, constants.ModelInitializer}},
+							{
+								TargetReplicatedJobs: []string{constants.Node},
+								Job: &trainer.JobScheduling{
+									ResourceClaims: []schedulingv1alpha3.WorkloadPodGroupResourceClaim{{
+										Name:                      "tpu-slice",
+										ResourceClaimTemplateName: ptr.To("tpu-slice-template"),
+									}},
+								},
+							},
+						},
+					}).
+					Obj()).
+				Obj(),
+			wantErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "trainer", "resourceClaimsPerNode"), ""),
+			},
+		},
+		"succeeds on create when the snapshot of a deleted TrainJob still exists": {
+			trainJob:        recreatedTrainJob,
+			existingRuntime: validRuntime,
+			existingObjects: []client.Object{staleSnapshot},
+			wantErrs:        nil,
+		},
+		"returns internal error on update when the snapshot belongs to another TrainJob": {
+			trainJob:        recreatedTrainJob,
+			oldTrainJob:     recreatedTrainJob,
+			existingRuntime: validRuntime,
+			existingObjects: []client.Object{staleSnapshot},
+			wantErrs: field.ErrorList{
+				field.InternalError(field.NewPath("spec", "runtimeRef"), errors.New("unable to get runtime snapshot: invalid runtime snapshot: a snapshot configmap exists but is owned by another object")),
+			},
+		},
 	}
 
 	for name, tc := range cases {
@@ -341,10 +407,11 @@ func TestClusterTrainingRuntimeValidateObjects(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 
-			clientBuilder := testingutil.NewClientBuilder()
+			clientBuilder := testingutil.WithWorkloadRESTMapping(testingutil.NewClientBuilder())
 			if tc.existingRuntime != nil {
 				clientBuilder = clientBuilder.WithObjects(tc.existingRuntime)
 			}
+			clientBuilder = clientBuilder.WithObjects(tc.existingObjects...)
 			c := clientBuilder.Build()
 
 			// Initialize the runtime factory (ClusterTrainingRuntime requires TrainingRuntime to be initialized first)
@@ -358,9 +425,19 @@ func TestClusterTrainingRuntimeValidateObjects(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			warnings, fieldErrors := clTrainingRuntime.ValidateObjects(ctx, nil, tc.trainJob)
+			warnings, fieldErrors := clTrainingRuntime.ValidateObjects(ctx, tc.oldTrainJob, tc.trainJob)
 
-			if diff := cmp.Diff(tc.wantErrs, fieldErrors, cmpopts.IgnoreFields(field.Error{}, "Detail")); diff != "" {
+			if diff := cmp.Diff(tc.wantErrs, fieldErrors,
+				cmpopts.IgnoreFields(field.Error{}, "Detail"),
+				cmp.FilterPath(func(p cmp.Path) bool {
+					sf, ok := p.Last().(cmp.StructField)
+					return ok && sf.Name() == "BadValue"
+				}, cmp.Transformer("ErrorString", func(v any) any {
+					if err, ok := v.(error); ok {
+						return err.Error()
+					}
+					return v
+				}))); diff != "" {
 				t.Errorf("Unexpected field errors (-want,+got):\n%s", diff)
 			}
 

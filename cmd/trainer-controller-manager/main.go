@@ -112,6 +112,7 @@ func main() {
 
 	restCfg := ctrl.GetConfigOrDie()
 	config.ApplyClientConnection(restCfg, &cfg)
+	config.ApplyNetworkPolicyCache(&options, &cfg)
 
 	setupLog.Info("Creating manager", "qps", restCfg.QPS, "burst", restCfg.Burst)
 	mgr, err := ctrl.NewManager(restCfg, options)
@@ -124,8 +125,8 @@ func main() {
 	if config.IsCertManagementEnabled(&cfg) {
 		setupLog.Info("Setting up certificate management")
 		if err = cert.ManageCerts(mgr, cert.Config{
-			WebhookSecretName:                  cfg.CertManagement.WebhookSecretName,
-			WebhookServiceName:                 cfg.CertManagement.WebhookServiceName,
+			SecretName:                         cfg.CertManagement.SecretName,
+			ServiceName:                        cfg.CertManagement.ServiceName,
 			ValidatingWebhookConfigurationName: validatingWebhookConfigurationName,
 			MutatingWebhookConfigurationName:   mutatingWebhookConfigurationName,
 		}, certsReady); err != nil {

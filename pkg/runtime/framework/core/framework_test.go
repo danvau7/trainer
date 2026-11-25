@@ -32,8 +32,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	batchv1ac "k8s.io/client-go/applyconfigurations/batch/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2/ktesting"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +51,7 @@ import (
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 	"github.com/kubeflow/trainer/v2/pkg/apply"
 	"github.com/kubeflow/trainer/v2/pkg/constants"
+	"github.com/kubeflow/trainer/v2/pkg/features"
 	"github.com/kubeflow/trainer/v2/pkg/runtime"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework"
 	fwkplugins "github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins"
@@ -58,6 +61,7 @@ import (
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset"
 	jobsetplgconsts "github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset/constants"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/mpi"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/networkpolicy"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/plainml"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/torch"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/volcano"
@@ -83,15 +87,16 @@ func TestNew(t *testing.T) {
 			wantFramework: &Framework{
 				registry: fwkplugins.NewRegistry(),
 				plugins: map[string]framework.Plugin{
-					coscheduling.Name: &coscheduling.CoScheduling{},
-					flux.Name:         &flux.Flux{},
-					volcano.Name:      &volcano.Volcano{},
-					mpi.Name:          &mpi.MPI{},
-					plainml.Name:      &plainml.PlainML{},
-					torch.Name:        &torch.Torch{},
-					jobset.Name:       &jobset.JobSet{},
-					jax.Name:          &jax.Jax{},
-					xgboost.Name:      &xgboost.XGBoost{},
+					coscheduling.Name:  &coscheduling.CoScheduling{},
+					flux.Name:          &flux.Flux{},
+					volcano.Name:       &volcano.Volcano{},
+					mpi.Name:           &mpi.MPI{},
+					plainml.Name:       &plainml.PlainML{},
+					networkpolicy.Name: &networkpolicy.NetworkPolicy{},
+					torch.Name:         &torch.Torch{},
+					jobset.Name:        &jobset.JobSet{},
+					jax.Name:           &jax.Jax{},
+					xgboost.Name:       &xgboost.XGBoost{},
 				},
 				enforceMLPlugins: []framework.EnforceMLPolicyPlugin{
 					&flux.Flux{},
@@ -115,6 +120,7 @@ func TestNew(t *testing.T) {
 					&xgboost.XGBoost{},
 				},
 				watchExtensionPlugins: []framework.WatchExtensionPlugin{
+					&networkpolicy.NetworkPolicy{},
 					&flux.Flux{},
 					&coscheduling.CoScheduling{},
 					&volcano.Volcano{},
@@ -125,6 +131,7 @@ func TestNew(t *testing.T) {
 					&jobset.JobSet{},
 				},
 				componentBuilderPlugins: []framework.ComponentBuilderPlugin{
+					&networkpolicy.NetworkPolicy{},
 					&flux.Flux{},
 					&coscheduling.CoScheduling{},
 					&volcano.Volcano{},
@@ -132,6 +139,7 @@ func TestNew(t *testing.T) {
 					&mpi.MPI{},
 				},
 				componentDeleterPlugins: []framework.ComponentDeleterPlugin{
+					&networkpolicy.NetworkPolicy{},
 					&volcano.Volcano{},
 				},
 				trainJobStatusPlugin: &jobset.JobSet{},
@@ -154,7 +162,7 @@ func TestNew(t *testing.T) {
 	}
 	cmpOpts := []cmp.Option{
 		cmp.AllowUnexported(Framework{}),
-		cmpopts.IgnoreUnexported(coscheduling.CoScheduling{}, flux.Flux{}, volcano.Volcano{}, mpi.MPI{}, plainml.PlainML{}, torch.Torch{}, jobset.JobSet{}, xgboost.XGBoost{}),
+		cmpopts.IgnoreUnexported(networkpolicy.NetworkPolicy{}, coscheduling.CoScheduling{}, flux.Flux{}, volcano.Volcano{}, mpi.MPI{}, plainml.PlainML{}, torch.Torch{}, jobset.JobSet{}, xgboost.XGBoost{}),
 		cmpopts.IgnoreFields(flux.Flux{}, "client", "scheme"),
 		cmpopts.IgnoreFields(coscheduling.CoScheduling{}, "client"),
 		cmpopts.IgnoreFields(volcano.Volcano{}, "client"),
@@ -195,7 +203,7 @@ func TestNew(t *testing.T) {
 }
 
 func TestNewPluginOrderIsDeterministic(t *testing.T) {
-	// Verify the implementation detail that plugins are executed in name order.
+	// Isolation runs first; other plugins retain deterministic name order.
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	clientBuilder := testingutil.NewClientBuilder()
@@ -222,13 +230,46 @@ func TestNewPluginOrderIsDeterministic(t *testing.T) {
 	for i, p := range fwk.componentBuilderPlugins {
 		buildNames[i] = p.(framework.Plugin).Name()
 	}
-	assertSorted("componentBuilderPlugins", buildNames)
+	if len(buildNames) == 0 || buildNames[0] != networkpolicy.Name {
+		t.Fatalf("isolation must be first: %v", buildNames)
+	}
+	assertSorted("componentBuilderPlugins", buildNames[1:])
 
 	validationNames := make([]string, len(fwk.customValidationPlugins))
 	for i, p := range fwk.customValidationPlugins {
 		validationNames[i] = p.(framework.Plugin).Name()
 	}
 	assertSorted("customValidationPlugins", validationNames)
+}
+
+type orderedBuilder struct {
+	framework.ComponentBuilderPlugin
+	order int
+}
+
+func (p *orderedBuilder) BuildOrder() int { return p.order }
+
+func TestNewComponentBuilderOrder(t *testing.T) {
+	c := testingutil.NewClientBuilder()
+	first := &orderedBuilder{ComponentBuilderPlugin: &networkpolicy.NetworkPolicy{}, order: -10}
+	last := &orderedBuilder{ComponentBuilderPlugin: &networkpolicy.NetworkPolicy{}, order: 10}
+	tieA := &orderedBuilder{ComponentBuilderPlugin: &networkpolicy.NetworkPolicy{}}
+	tieB := &orderedBuilder{ComponentBuilderPlugin: &networkpolicy.NetworkPolicy{}}
+	plain := &flux.Flux{}
+	registry := fwkplugins.Registry{}
+	for name, plugin := range map[string]framework.Plugin{"Z-first": first, "A-last": last, "B-tie": tieB, "A-tie": tieA, "C-default": plain} {
+		registry[name] = func(context.Context, client.Client, client.FieldIndexer, *configapi.Configuration) (framework.Plugin, error) {
+			return plugin, nil
+		}
+	}
+	fwk, err := New(context.Background(), c.Build(), registry, testingutil.AsIndex(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []framework.ComponentBuilderPlugin{first, tieA, tieB, plain, last}
+	if !slices.Equal(fwk.componentBuilderPlugins, want) {
+		t.Fatal("builders must follow explicit order, then deterministic name order; unspecified order is zero")
+	}
 }
 
 func TestRunEnforceMLPolicyPlugins(t *testing.T) {
@@ -1017,7 +1058,7 @@ func TestRunComponentBuilderPlugins(t *testing.T) {
 														WithArgs("args:openssh").
 														WithCommand("command:openssh").
 														WithResources(nodeContainerRequests("1", "4Gi")).
-														WithImage("test:openssh").
+														WithImage("test:trainjob").
 														WithVolumeMounts(
 															corev1ac.VolumeMount().
 																WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -1116,7 +1157,8 @@ func TestRunComponentBuilderPlugins(t *testing.T) {
 								corev1.ResourceMemory: resource.MustParse("4Gi"),
 							},
 							Containers: []runtime.Container{{
-								Name: constants.Node,
+								Name:  constants.Node,
+								Image: "test:trainjob",
 								VolumeMounts: []corev1ac.VolumeMountApplyConfiguration{
 									*corev1ac.VolumeMount().
 										WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -1206,7 +1248,8 @@ func TestRunComponentBuilderPlugins(t *testing.T) {
 								corev1.ResourceMemory: resource.MustParse("4Gi"),
 							},
 							Containers: []runtime.Container{{
-								Name: constants.Node,
+								Name:  constants.Node,
+								Image: "test:trainjob",
 								VolumeMounts: []corev1ac.VolumeMountApplyConfiguration{
 									*corev1ac.VolumeMount().
 										WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -1403,7 +1446,7 @@ func TestRunComponentBuilderPlugins(t *testing.T) {
 						corev1.ResourceCPU:    resource.MustParse("1"),
 						corev1.ResourceMemory: resource.MustParse("4Gi"),
 					}).
-					Container(constants.Node, constants.Node, "test:openssh", []string{"command:openssh"}, []string{"args:openssh"}, corev1.ResourceList{
+					Container(constants.Node, constants.Node, "test:trainjob", []string{"command:openssh"}, []string{"args:openssh"}, corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("1"),
 						corev1.ResourceMemory: resource.MustParse("4Gi"),
 					}).
@@ -1503,6 +1546,7 @@ test-job-node-0-1.test-job slots=1
 								corev1.ResourceMemory: resource.MustParse("8Gi"),
 							},
 							Containers: []runtime.Container{{
+								Name: constants.Node,
 								VolumeMounts: []corev1ac.VolumeMountApplyConfiguration{
 									*corev1ac.VolumeMount().
 										WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -1810,6 +1854,8 @@ test-job-node-0-1.test-job slots=1
 								corev1.ResourceMemory: resource.MustParse("8Gi"),
 							},
 							Containers: []runtime.Container{{
+								Name:  constants.Node,
+								Image: "test:trainjob",
 								VolumeMounts: []corev1ac.VolumeMountApplyConfiguration{
 									*corev1ac.VolumeMount().
 										WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -1928,6 +1974,7 @@ test-job-node-0-1.test-job slots=1
 								corev1.ResourceMemory: resource.MustParse("4Gi"),
 							},
 							Containers: []runtime.Container{{
+								Name: constants.Node,
 								VolumeMounts: []corev1ac.VolumeMountApplyConfiguration{
 									*corev1ac.VolumeMount().
 										WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -2130,6 +2177,8 @@ test-job-node-0-1.test-job slots=1
 								corev1.ResourceMemory: resource.MustParse("4Gi"),
 							},
 							Containers: []runtime.Container{{
+								Name:  constants.Node,
+								Image: "test:trainjob",
 								VolumeMounts: []corev1ac.VolumeMountApplyConfiguration{
 									*corev1ac.VolumeMount().
 										WithName(jobsetplgconsts.VolumeNameInitializer).
@@ -2472,6 +2521,7 @@ func TestWatchExtensionPlugins(t *testing.T) {
 		"coscheduling, jobset, and mpi are performed": {
 			registry: fwkplugins.NewRegistry(),
 			wantPlugins: []framework.WatchExtensionPlugin{
+				&networkpolicy.NetworkPolicy{},
 				&flux.Flux{},
 				&coscheduling.CoScheduling{},
 				&volcano.Volcano{},
@@ -2485,7 +2535,7 @@ func TestWatchExtensionPlugins(t *testing.T) {
 	}
 	cmpOpts := []cmp.Option{
 		cmpopts.SortSlices(func(a, b framework.Plugin) bool { return a.Name() < b.Name() }),
-		cmpopts.IgnoreUnexported(coscheduling.CoScheduling{}, volcano.Volcano{}, jobset.JobSet{}, mpi.MPI{}, flux.Flux{}),
+		cmpopts.IgnoreUnexported(networkpolicy.NetworkPolicy{}, coscheduling.CoScheduling{}, volcano.Volcano{}, jobset.JobSet{}, mpi.MPI{}, flux.Flux{}),
 		cmpopts.IgnoreFields(flux.Flux{}, "client", "scheme"),
 	}
 	for name, tc := range cases {
@@ -2854,6 +2904,83 @@ func TestRunPreComponentBuilderPlugins(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.wantRuntimeInfo, tc.runtimeInfo, testingutil.PodSetEndpointsCmpOpts); len(diff) != 0 {
 				t.Errorf("Unexpected runtimeInfo (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRunEnforceSchedulingPlugins(t *testing.T) {
+	// Do not use t.Parallel() — SetFeatureGateDuringTest mutates global state.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobWorkloadAwareScheduling, true)
+	cases := map[string]struct {
+		registry        fwkplugins.Registry
+		runtimeInfo     *runtime.Info
+		trainJob        *trainer.TrainJob
+		wantRuntimeInfo *runtime.Info
+	}{
+		"WorkloadAwareScheduling plugin is applied to runtime.Info": {
+			registry: fwkplugins.NewRegistry(),
+			runtimeInfo: &runtime.Info{
+				RuntimePolicy: runtime.RuntimePolicy{
+					Scheduling: &trainer.TrainingRuntimeScheduling{},
+				},
+				TemplateSpec: runtime.TemplateSpec{
+					PodSets: []runtime.PodSet{{Name: constants.Node, Count: ptr.To[int32](1)}},
+				},
+			},
+			trainJob: &trainer.TrainJob{ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: metav1.NamespaceDefault, UID: "uid"}},
+			wantRuntimeInfo: &runtime.Info{
+				RuntimePolicy: runtime.RuntimePolicy{
+					Scheduling: &trainer.TrainingRuntimeScheduling{},
+				},
+				TemplateSpec: runtime.TemplateSpec{
+					PodSets: []runtime.PodSet{{
+						Name:            constants.Node,
+						Count:           ptr.To[int32](1),
+						SchedulingGroup: corev1ac.PodSchedulingGroup().WithPodGroupName("test-job-e2577dd78b-b6ff97ef4e"),
+					}},
+				},
+			},
+		},
+		"an empty registry": {
+			runtimeInfo: &runtime.Info{
+				RuntimePolicy: runtime.RuntimePolicy{
+					Scheduling: &trainer.TrainingRuntimeScheduling{},
+				},
+				TemplateSpec: runtime.TemplateSpec{
+					PodSets: []runtime.PodSet{{Name: constants.Node, Count: ptr.To[int32](1)}},
+				},
+			},
+			trainJob: &trainer.TrainJob{ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: metav1.NamespaceDefault, UID: "uid"}},
+			wantRuntimeInfo: &runtime.Info{
+				RuntimePolicy: runtime.RuntimePolicy{
+					Scheduling: &trainer.TrainingRuntimeScheduling{},
+				},
+				TemplateSpec: runtime.TemplateSpec{
+					PodSets: []runtime.PodSet{{Name: constants.Node, Count: ptr.To[int32](1)}},
+				},
+			},
+		},
+		"runtime.Info is nil": {
+			registry: fwkplugins.NewRegistry(),
+			trainJob: &trainer.TrainJob{ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: metav1.NamespaceDefault, UID: "uid"}},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			clientBuilder := testingutil.WithWorkloadRESTMapping(testingutil.NewClientBuilder())
+
+			fwk, err := New(ctx, clientBuilder.Build(), tc.registry, testingutil.AsIndex(clientBuilder), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = fwk.RunEnforceSchedulingPlugins(tc.runtimeInfo, tc.trainJob); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantRuntimeInfo, tc.runtimeInfo); len(diff) != 0 {
+				t.Errorf("Unexpected runtime.Info (-want,+got): %s", diff)
 			}
 		})
 	}

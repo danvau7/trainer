@@ -21,15 +21,22 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/rest"
 	componentconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,6 +45,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/features"
+	"github.com/kubeflow/trainer/v2/pkg/util/cert"
 )
 
 func TestLoad(t *testing.T) {
@@ -69,6 +78,15 @@ webhook:
 clientConnection:
   qps: 100
   burst: 200
+networkPolicy:
+  enabled: true
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.0/24
+      ports:
+        - protocol: TCP
+          port: 443
 `), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
@@ -79,8 +97,8 @@ apiVersion: config.trainer.kubeflow.org/v1alpha1
 kind: Configuration
 certManagement:
   enable: true
-  webhookServiceName: custom-webhook-service
-  webhookSecretName: custom-webhook-secret
+  serviceName: custom-webhook-service
+  secretName: custom-webhook-secret
 `), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
@@ -198,8 +216,8 @@ controller:
     TrainingRuntime.trainer.kubeflow.org: 1
 certManagement:
   enable: true
-  webhookServiceName: kubeflow-trainer-controller-manager
-  webhookSecretName: kubeflow-trainer-webhook-cert
+  serviceName: kubeflow-trainer-controller-manager
+  secretName: kubeflow-trainer-webhook-cert
 clientConnection:
   qps: 50
   burst: 100
@@ -273,9 +291,9 @@ this is not: valid: yaml: content
 	}
 
 	defaultCertManagement := &configapi.CertManagement{
-		Enable:             ptr.To(true),
-		WebhookServiceName: "kubeflow-trainer-controller-manager",
-		WebhookSecretName:  "kubeflow-trainer-webhook-cert",
+		Enable:      ptr.To(true),
+		ServiceName: "kubeflow-trainer-controller-manager",
+		SecretName:  "kubeflow-trainer-webhook-cert",
 	}
 
 	defaultClientConnection := &configapi.ClientConnection{
@@ -403,6 +421,13 @@ this is not: valid: yaml: content
 					QPS:   ptr.To[float32](100),
 					Burst: ptr.To[int32](200),
 				},
+				NetworkPolicy: &configapi.NetworkPolicyConfig{
+					Enabled: ptr.To(true),
+					Egress: []networkingv1.NetworkPolicyEgressRule{{
+						To:    []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.0/24"}}},
+						Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolTCP), Port: ptr.To(intstr.FromInt(443))}},
+					}},
+				},
 				StatusServer: defaultStatusServer,
 			},
 			wantOptions: ctrl.Options{
@@ -512,9 +537,9 @@ this is not: valid: yaml: content
 				ClientConnection: defaultClientConnection,
 				StatusServer:     defaultStatusServer,
 				CertManagement: &configapi.CertManagement{
-					Enable:             ptr.To(true),
-					WebhookServiceName: "custom-webhook-service",
-					WebhookSecretName:  "custom-webhook-secret",
+					Enable:      ptr.To(true),
+					ServiceName: "custom-webhook-service",
+					SecretName:  "custom-webhook-secret",
 				},
 			},
 			wantOptions: defaultOptions,
@@ -530,9 +555,9 @@ this is not: valid: yaml: content
 				ClientConnection: defaultClientConnection,
 				StatusServer:     defaultStatusServer,
 				CertManagement: &configapi.CertManagement{
-					Enable:             ptr.To(false),
-					WebhookServiceName: "kubeflow-trainer-controller-manager",
-					WebhookSecretName:  "kubeflow-trainer-webhook-cert",
+					Enable:      ptr.To(false),
+					ServiceName: "kubeflow-trainer-controller-manager",
+					SecretName:  "kubeflow-trainer-webhook-cert",
 				},
 			},
 			wantOptions: defaultOptions,
@@ -768,6 +793,53 @@ this is not: valid: yaml: content
 	}
 }
 
+func TestApplyNetworkPolicyCache(t *testing.T) {
+	for name, tc := range map[string]struct {
+		policy       *configapi.NetworkPolicyConfig
+		optimization bool
+	}{
+		"omitted":              {},
+		"disabled":             {policy: &configapi.NetworkPolicyConfig{Enabled: ptr.To(false)}},
+		"enabled":              {policy: &configapi.NetworkPolicyConfig{Enabled: ptr.To(true)}},
+		"with OptimizationJob": {policy: &configapi.NetworkPolicyConfig{Enabled: ptr.To(true)}, optimization: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobStatus, true)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.OptimizationJob, tc.optimization)
+			options := ctrl.Options{}
+			ApplyNetworkPolicyCache(&options, &configapi.Configuration{NetworkPolicy: tc.policy})
+			if tc.policy == nil || !ptr.Deref(tc.policy.Enabled, false) {
+				if len(options.Cache.ByObject) != 0 || options.Client.Cache != nil {
+					t.Fatal("disabled isolation must not scope infrastructure caches or bypass policy metadata caching")
+				}
+				return
+			}
+			for object, scope := range options.Cache.ByObject {
+				if len(scope.Namespaces) != 2 {
+					t.Fatalf("%T must watch only infrastructure namespaces: %v", object, scope.Namespaces)
+				}
+				for _, namespace := range []string{corev1.NamespaceDefault, cert.GetOperatorNamespace()} {
+					if _, found := scope.Namespaces[namespace]; !found {
+						t.Fatalf("%T missing infrastructure namespace %q", object, namespace)
+					}
+				}
+			}
+			var slicesScoped, servicesScoped bool
+			for object := range options.Cache.ByObject {
+				switch object.(type) {
+				case *discoveryv1.EndpointSlice:
+					slicesScoped = true
+				case *corev1.Service:
+					servicesScoped = true
+				}
+			}
+			if !slicesScoped || servicesScoped == tc.optimization {
+				t.Fatal("scope EndpointSlices and preserve the OptimizationJob Service watch")
+			}
+		})
+	}
+}
+
 func TestHealthEndpointPath(t *testing.T) {
 	testcases := map[string]struct {
 		endpointName string
@@ -975,10 +1047,18 @@ tls:
     - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
     - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
 `)
+	curvePreferencesConfig := writeConfig("curve-preferences.yaml", `
+tls:
+  curvePreferences: [29, 23]
+`)
 	unknownConfig := writeConfig("unknown.yaml", `
 tls:
   minVersion: "1.3"
   cipherSuites: ["TLS_NOT_A_REAL_SUITE"]
+`)
+	unknownCurveConfig := writeConfig("unknown-curve.yaml", `
+tls:
+  curvePreferences: [9999]
 `)
 
 	testcases := map[string]struct {
@@ -986,6 +1066,9 @@ tls:
 		wantNextProtos   []string
 		wantMinVersion   uint16
 		wantCipherSuites []uint16
+		wantCurvePrefs   []tls.CurveID
+		wantLoadErr      bool
+		wantLoadErrText  string
 	}{
 		"HTTP/2 is disabled by default": {
 			configFile:     "",
@@ -1008,16 +1091,35 @@ tls:
 				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			},
 		},
-		"unrecognized cipher suite is dropped without clobbering other settings": {
-			configFile:     unknownConfig,
+		"curvePreferences are resolved to their IDs": {
+			configFile:     curvePreferencesConfig,
 			wantNextProtos: []string{"http/1.1"},
-			wantMinVersion: tls.VersionTLS13,
+			wantCurvePrefs: []tls.CurveID{tls.X25519, tls.CurveP256},
+		},
+		"unrecognized cipher suite fails configuration loading": {
+			configFile:      unknownConfig,
+			wantLoadErr:     true,
+			wantLoadErrText: "tls.cipherSuites[0]",
+		},
+		"unsupported curve ID fails configuration loading": {
+			configFile:      unknownCurveConfig,
+			wantLoadErr:     true,
+			wantLoadErrText: "tls.curvePreferences",
 		},
 	}
 
 	for name, tc := range testcases {
 		t.Run(name, func(t *testing.T) {
 			options, _, err := Load(testScheme, tc.configFile)
+			if tc.wantLoadErr {
+				if err == nil {
+					t.Fatal("Expected load error, got nil")
+				}
+				if tc.wantLoadErrText != "" && !strings.Contains(err.Error(), tc.wantLoadErrText) {
+					t.Errorf("Load() error %q does not contain %q", err, tc.wantLoadErrText)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
@@ -1046,6 +1148,9 @@ tls:
 			}
 			if diff := cmp.Diff(tc.wantCipherSuites, got.CipherSuites, cmpopts.EquateEmpty()); len(diff) != 0 {
 				t.Errorf("Unexpected CipherSuites (-want,+got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantCurvePrefs, got.CurvePreferences, cmpopts.EquateEmpty()); len(diff) != 0 {
+				t.Errorf("Unexpected CurvePreferences (-want,+got):\n%s", diff)
 			}
 		})
 	}
