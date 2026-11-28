@@ -23,6 +23,5 @@ approvers: []
 stage: alpha
 see-also:
   - https://github.com/kubeflow/trainer/issues/3120
-  - https://github.com/kubeflow/trainer/pull/4308
 feature-gates:
   - name: TrainJobNetworkPolicy
